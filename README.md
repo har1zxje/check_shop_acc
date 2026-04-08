@@ -1,0 +1,1 @@
+# check_shop_acc
