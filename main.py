@@ -7,23 +7,26 @@ from dotenv import load_dotenv
 from flask import Flask
 from threading import Thread
 import time
+import gc
 
-# --- PHẦN 1: FLASK WEB SERVER (TỐI ƯU CHO RENDER) ---
+# --- PHẦN 1: FLASK WEB SERVER (GIỮ BOT THỨC 24/7 TRÊN RENDER) ---
 app = Flask('')
 
 @app.route('/')
 def home():
-    return "Bot is Online and Alive!"
+    now = datetime.datetime.now().strftime('%H:%M:%S')
+    return f"Bot is Online and Alive! Last system ping: {now}"
 
 def run():
-    # Render yêu cầu lắng nghe trên Port hệ thống cấp (thường là 10000)
+    # Lấy cổng từ hệ thống Render, mặc định là 10000
     port = int(os.environ.get("PORT", 10000))
-    print(f"--- Flask đang khởi động tại Port: {port} ---")
-    app.run(host='0.0.0.0', port=port)
+    print(f"--- Flask đang bắt đầu lắng nghe tại Port: {port} ---")
+    # Tắt debug và reloader để tiết kiệm RAM tối đa cho gói Free
+    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
 
 def keep_alive():
     t = Thread(target=run)
-    t.daemon = True # Đặt daemon để thread này không bị kẹt khi tắt bot
+    t.daemon = True 
     t.start()
 
 # --- PHẦN 2: CẤU HÌNH BOT DISCORD ---
@@ -36,8 +39,9 @@ try:
     from shop_acc import MY_ACCOUNTS
 except ImportError:
     MY_ACCOUNTS = []
-    print("❌ LỖI: Không tìm thấy file shop_acc.py!")
+    print("❌ LỖI: Không tìm thấy file shop_acc.py trên hệ thống!")
 
+# Cài đặt Intents (Nhớ bật Message Content Intent trong Discord Developer Portal)
 intents = discord.Intents.default()
 intents.message_content = True 
 bot = commands.Bot(command_prefix='?v', intents=intents)
@@ -58,28 +62,28 @@ def get_val_details(name, tag):
     default_icon = "https://media.valorant-api.com/displayicons/v1/64581831-4828-02ba-775f-2c8c45f448e8/displayicon.png"
 
     try:
+        # Gọi API MMR
         r_mmr = requests.get(mmr_url, headers=headers, timeout=10)
+        time.sleep(0.3) # Giãn cách cực ngắn tránh lỗi API Rate Limit của HenrikDev
+        
+        # Gọi API History
         r_hist = requests.get(history_url, headers=headers, timeout=10)
         
         if r_mmr.status_code == 200 and r_hist.status_code == 200:
             m_data = r_mmr.json().get('data')
             h_data = r_hist.json().get('data', [])[:5]
             
-            if not m_data: 
-                return {"status": "error", "msg": "No Data", "name": name, "tag": tag, "rank_icon": default_icon}
+            if not m_data: return None
 
             history_list = []
             for m in h_data:
                 change = m.get('mmr_change_to_last_game', 0)
                 t_ago = get_time_ago(m.get('date_raw'))
                 
-                # FIX LỖI DẤU TRÙNG LẶP (Cực kỳ quan trọng)
-                if change > 0:
-                    mark, val = "+ ", change
-                elif change < 0:
-                    mark, val = "- ", abs(change)
-                else:
-                    mark, val = "  ", 0
+                # SỬA LỖI DẤU TRÙNG LẶP: Dùng abs() để đảm bảo không bị hiện - -22
+                if change > 0: mark, val = "+ ", change
+                elif change < 0: mark, val = "- ", abs(change)
+                else: mark, val = "  ", 0
                 history_list.append(f"{mark}{val} ({t_ago})")
 
             tier_id = m_data.get('currenttier', 0)
@@ -94,69 +98,88 @@ def get_val_details(name, tag):
                 "history": history_list,
                 "rank_icon": icon_url
             }
-        return {"status": "error", "msg": f"API {r_mmr.status_code}", "name": name, "tag": tag, "rank_icon": default_icon}
-    except Exception as e:
-        return {"status": "error", "msg": "Network Error", "name": name, "tag": tag, "rank_icon": default_icon}
+    except Exception:
+        return None
+    return None
 
 @bot.command()
 async def rank(ctx):
-    await ctx.send("🔍 **Đang quét và sắp xếp danh sách theo MMR...**")
+    # Tin nhắn phản hồi ban đầu
+    status_msg = await ctx.send("🔍 **Đang quét và sắp xếp danh sách theo MMR...**")
     
     results = []
     for acc in MY_ACCOUNTS:
-        results.append(get_val_details(acc['name'], acc['tag']))
+        data = get_val_details(acc['name'], acc['tag'])
+        if data:
+            results.append(data)
+        # NGHỈ 1.5 GIÂY giữa mỗi account: Đây là khóa để tránh lỗi 429 Too Many Requests
+        time.sleep(1.5)
 
-    # Sắp xếp giảm dần theo Elo (MMR cao nhất lên đầu)
-    success_data = sorted([r for r in results if r['status'] == "ok"], key=lambda x: x['elo'], reverse=True)
-    error_data = [r for r in results if r['status'] != "ok"]
+    if not results:
+        return await status_msg.edit(content="❌ Không thể lấy dữ liệu từ API. Hãy kiểm tra API Key hoặc tên tài khoản.")
 
+    # Sắp xếp giảm dần theo Elo (Người MMR cao nhất lên đầu)
+    success_data = sorted(results, key=lambda x: x['elo'], reverse=True)
+    
     embed = discord.Embed(
         title="🛡️ HỆ THỐNG PHÂN TÍCH RANK VALORANT",
-        description="Danh sách sắp xếp theo **MMR (Elo)** cao nhất xuống thấp nhất.",
+        description="Dữ liệu được sắp xếp theo **MMR (Elo)** cao nhất xuống thấp nhất.",
         color=0xfa4454
     )
 
     for res in success_data:
         history_text = "\n".join(res['history'])
         val_info = (
-            f"**Rank:** `{res['rank_name']}` — **{res['rr']} RR**\n"
-            f"**Lịch sử:**\n```diff\n{history_text if history_text else 'Chưa có dữ liệu'}\n```"
-            f"**MMR Ẩn (Elo):** `{res['elo']}`\n"
+            f"**Hạng:** `{res['rank_name']}` — **{res['rr']} RR**\n"
+            f"**Lịch sử gần đây:**\n```diff\n{history_text if history_text else 'Chưa có dữ liệu'}\n```"
+            f"**Elo hiện tại:** `{res['elo']}`\n"
             f"──────────────────"
         )
         embed.add_field(name=f"👤 {res['name']}#{res['tag']}", value=val_info, inline=False)
         
-        # Thumbnail luôn lấy hình rank của tài khoản TOP 1 MMR
+        # Thumbnail lấy hình rank của người đứng Top 1 MMR
         if res == success_data[0]:
             embed.set_thumbnail(url=res['rank_icon'])
 
-    for err in error_data:
-        embed.add_field(name=f"❌ LỖI - {err['name']}#{err['tag']}", value=f"**Nguyên nhân:** `{err['msg']}`", inline=False)
-
-    timestamp = datetime.datetime.now().strftime('%H:%M - %d/%m/%Y')
-    embed.set_footer(text=f"Yêu cầu bởi {ctx.author.name} • {timestamp}", icon_url=ctx.author.display_avatar.url)
+    now_time = datetime.datetime.now().strftime('%H:%M - %d/%m/%Y')
+    embed.set_footer(text=f"Yêu cầu bởi {ctx.author.name} • {now_time}", icon_url=ctx.author.display_avatar.url)
     
-    await ctx.send(embed=embed)
+    # Sửa tin nhắn chờ thành bảng kết quả
+    await status_msg.edit(content=None, embed=embed)
+    
+    # Dọn dẹp RAM ngay sau khi xong việc nặng để Render không tắt bot
+    gc.collect()
 
 @bot.event
 async def on_ready():
-    print(f'✅ Bot Discord đã đăng nhập: {bot.user}')
+    print(f'✅ Bot Discord đã trực tuyến: {bot.user}')
 
 @bot.event
 async def on_message(message):
     if message.author == bot.user: return
     await bot.process_commands(message)
 
-# --- PHẦN 3: KHỞI CHẠY ---
+# --- PHẦN 3: KHỞI CHẠY VỚI CHẾ ĐỘ TỰ KẾT NỐI LẠI (GIẢI QUYẾT LỖI 429) ---
 if __name__ == "__main__":
-    # 1. Bật Flask trước để Render kiểm tra Port thành công ngay lập tức
+    # Khởi động Flask trước
     keep_alive()
+    time.sleep(5)
     
-    # 2. Nghỉ một chút để luồng Flask ổn định
-    time.sleep(2) 
-    
-    # 3. Chạy Bot Discord
-    if DISCORD_TOKEN:
-        bot.run(DISCORD_TOKEN)
-    else:
-        print("❌ LỖI: Thiếu DISCORD_TOKEN trong Environment Variables!")
+    while True:
+        try:
+            if DISCORD_TOKEN:
+                print("🚀 Đang khởi động Discord Client...")
+                bot.run(DISCORD_TOKEN)
+            else:
+                print("❌ KHÔNG CÓ DISCORD_TOKEN. Hãy kiểm tra Environment Variables.")
+                break
+        except discord.errors.HTTPException as e:
+            if e.status == 429:
+                print("⚠️ CẢNH BÁO: Discord đang chặn yêu cầu (Rate Limit). Nghỉ 60s để phục hồi...")
+                time.sleep(60)
+            else:
+                print(f"❌ Lỗi HTTP: {e}. Thử lại sau 10s...")
+                time.sleep(10)
+        except Exception as e:
+            print(f"❌ Lỗi hệ thống: {e}. Đang tái khởi động sau 10s...")
+            time.sleep(10)
